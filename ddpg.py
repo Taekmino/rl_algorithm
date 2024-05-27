@@ -6,22 +6,39 @@ import torch.optim as optim
 import random
 from collections import deque
 import wandb
-
-
-#setting
-cfg = {
-    "GAMMA" :       0.99,
-    "TAU" :         0.005,
-    "LR_ACTOR" :    1e-4,
-    "LR_CRITIC" :   1e-3,
-    "BUFFER_SIZE" : 1000000,
-    "BATCH_SIZE" :  128,
-    "EPISODES":     500,
-    "NUM_SEEDS" : 10
-}
-# wandb.init(project="DDPG Pendulum", reinit=True, config=cfg)
+import argparse
 
 device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seeds", type=int, default=10, help="Number of seeds of iteration")
+    parser.add_argument("--mode", choices=["train", "test"], required=True, help="Mode: train or test")
+    parser.add_argument("--train_episodes", type=int, default=1000, help="Number of training episodes")
+    parser.add_argument("--test_episodes", type=int, default=10, help="Number of testing episodes")
+    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
+    parser.add_argument("--tau", type=float, default=0.005, help="Soft update factor")
+    parser.add_argument("--lr_actor", type=float, default=1e-4, help="Learning rate for actor")
+    parser.add_argument("--lr_critic", type=float, default=1e-3, help="Learning rate for critic")
+    parser.add_argument("--buffer_size", type=int, default=1000000, help="Replay buffer size")
+    parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
+    parser.add_argument("--project_name", type=str, default="DDPG Pendulum", help="wandb project name")
+    return parser.parse_args()
+
+def initialize_cfg(args):
+    wandb.init(project=args.project_name)
+    config = {
+        "GAMMA": args.gamma,
+        "TAU": args.tau,
+        "LR_ACTOR": args.lr_actor,
+        "LR_CRITIC": args.lr_critic,
+        "BUFFER_SIZE": args.buffer_size,
+        "BATCH_SIZE": args.batch_size,
+        "TRAIN_EPISODES": args.train_episodes,
+        "TEST_EPISODES": args.test_episodes
+    }
+    wandb.config.update(config)
+    return config
 
 #util function
 def seed_all(seed):
@@ -65,13 +82,13 @@ class Critic(nn.Module):
 
 # Replay Buffer
 class ReplayBuffer:
-    def __init__(self, max_size=cfg["BUFFER_SIZE"]):
+    def __init__(self, max_size):
         self.buffer = deque(maxlen=max_size)
 
     def add(self, state, action, reward, next_state, done):
         self.buffer.append((state, action, reward, next_state, done))
 
-    def sample(self, batch_size=cfg["BATCH_SIZE"]):
+    def sample(self, batch_size):
         state, action, reward, next_state, done = zip(*random.sample(self.buffer, batch_size))
         return np.array(state), np.array(action), np.array(reward), np.array(next_state), np.array(done)
 
@@ -80,29 +97,34 @@ class ReplayBuffer:
 
 # DDPG Agent
 class DDPGAgent:
-    def __init__(self, state_dim, action_dim, max_action):
+    def __init__(self, state_dim, action_dim, max_action, config):
         self.actor = Actor(state_dim, action_dim, max_action).to(device)
         self.actor_target = Actor(state_dim, action_dim, max_action).to(device)
         self.actor_target.load_state_dict(self.actor.state_dict())
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=cfg["LR_ACTOR"])
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=config["LR_ACTOR"])
 
         self.critic = Critic(state_dim, action_dim).to(device)
         self.critic_target = Critic(state_dim, action_dim).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=cfg["LR_CRITIC"])
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=config["LR_CRITIC"])
 
-        self.replay_buffer = ReplayBuffer()
+        self.replay_buffer = ReplayBuffer(config["BUFFER_SIZE"])
         self.max_action = max_action
+        self.gamma = config["GAMMA"]
+        self.tau = config["TAU"]
+        self.batch_size = config["BATCH_SIZE"]
 
-    def select_action(self, state):
+    def select_action(self, state, noise=0.0):
         state = torch.FloatTensor(state.reshape(1, -1)).to(device)
-        return self.actor(state).cpu().data.numpy().flatten()
-
+        action = self.actor(state).cpu().data.numpy().flatten()
+        action = np.clip(action + np.random.normal(0, noise, size=action.shape), -self.max_action, self.max_action)
+        return action
+    
     def train(self):
-        if self.replay_buffer.size() < cfg["BATCH_SIZE"]:
-            return
+        if self.replay_buffer.size() < self.batch_size:
+            return None, None
 
-        state, action, reward, next_state, done = self.replay_buffer.sample(cfg["BATCH_SIZE"])
+        state, action, reward, next_state, done = self.replay_buffer.sample(self.batch_size)
 
         state = torch.FloatTensor(state).to(device)
         action = torch.FloatTensor(action).to(device)
@@ -111,7 +133,7 @@ class DDPGAgent:
         done = torch.FloatTensor(done).reshape(-1, 1).to(device)
 
         target_q = self.critic_target(next_state, self.actor_target(next_state))
-        target_q = reward + ((1 - done) * cfg["GAMMA"] * target_q).detach()
+        target_q = reward + ((1 - done) * self.gamma * target_q).detach()
 
         current_q = self.critic(state, action)
 
@@ -126,10 +148,12 @@ class DDPGAgent:
         self.actor_optimizer.step()
 
         for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
-            target_param.data.copy_(cfg["TAU"] * param.data + (1 - cfg["TAU"]) * target_param.data)
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
         for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
-            target_param.data.copy_(cfg["TAU"] * param.data + (1 - cfg["TAU"]) * target_param.data)
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+        return critic_loss.item(), actor_loss.item()
 
     def save(self, filename):
         torch.save(self.actor.state_dict(), filename + "_actor.pth")
@@ -139,48 +163,93 @@ class DDPGAgent:
         self.actor.load_state_dict(torch.load(filename + "_actor.pth", map_location=device))
         self.critic.load_state_dict(torch.load(filename + "_critic.pth", map_location=device))
 
-# Main training loop
-for seed in range(cfg["NUM_SEEDS"]):
-    wandb.init(project="DDPG Pendulum", reinit=True, name=f'seed_{seed}', config=cfg)
-    seed_all(seed)
-
-    env = gym.make('Pendulum-v1')
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
-    max_action = float(env.action_space.high[0])
-
-    agent = DDPGAgent(state_dim, action_dim, max_action)
+def train(env, agent, episodes):
     best_reward = -float('inf')
-
-    for episode in range(cfg["EPISODES"]):
+    for episode in range(episodes):
         state, _ = env.reset()
         episode_reward = 0
+        episode_critic_loss = 0
+        episode_actor_loss = 0
+        loss_count = 0
+
         while True:
-            action = agent.select_action(np.array(state))
+            action = agent.select_action(state, noise=0.1)
             next_state, reward, done, truncated, _ = env.step(action)
             agent.replay_buffer.add(state, action, reward, next_state, done)
             state = next_state
 
             episode_reward += reward
             agent.train()
+            critic_loss, actor_loss = agent.train()
+
+            if critic_loss is not None and actor_loss is not None:
+                episode_critic_loss += critic_loss
+                episode_actor_loss += actor_loss
+                loss_count += 1
 
             if truncated:
                 if episode_reward > best_reward:
                     best_reward = episode_reward
                     wandb.run.summary["best_episode_reward"] = episode_reward
-                    agent.save("ddpg_pendulum")
-                    print("save!!")
-
                 break
-
-        print(f"Episode {episode + 1}, Reward: {episode_reward}")
+        
+        if loss_count > 0:
+            episode_critic_loss /= loss_count
+            episode_actor_loss /= loss_count
 
         wandb.log({
-            "episode_reward" : episode_reward
+            "episode": episode + 1,
+            "reward": episode_reward,
+            "critic_loss": episode_critic_loss if loss_count > 0 else None,
+            "actor_loss": episode_actor_loss if loss_count > 0 else None
         })
+        print(f"Episode {episode + 1}, Reward: {episode_reward}, Critic Loss: {episode_critic_loss}, Actor Loss: {episode_actor_loss}")
 
-    # Save the trained model
-    agent.save("ddpg_pendulum")
+def test(env, agent, episodes):
+    rewards = []
+    for episode in range(episodes):
+        state, _ = env.reset()
+        episode_reward = 0
+        while True:
+            action = agent.select_action(state)
+            next_state, reward, done, truncated, _ = env.step(action)
+            state = next_state
+            episode_reward += reward
 
-# To load the model
-# agent.load("ddpg_pendulum")
+            if truncated:
+                break
+
+        rewards.append(episode_reward)
+        print(f"Test Episode {episode + 1}, Reward: {episode_reward}")
+    avg_reward = np.mean(rewards)
+    wandb.log({"avg_test_reward": avg_reward})
+    print(f"Average Test Reward: {avg_reward}")
+
+def main():
+    args = get_args()
+    config = initialize_cfg(args)
+    for seed in range(args.seeds):
+        wandb.init(project=args.project_name, reinit=True, name=f'seed_{seed}', config=config)
+        seed_all(seed)
+
+        env = gym.make('Pendulum-v1')
+        state_dim = env.observation_space.shape[0]
+        action_dim = env.action_space.shape[0]
+        max_action = float(env.action_space.high[0])
+
+        agent = DDPGAgent(state_dim, action_dim, max_action, config)
+
+        if args.mode == "train":
+            print("Starting training...")
+            train(env, agent, args.train_episodes)
+            wandb.save("ddpg_pendulum_actor.pth")
+            wandb.save("ddpg_pendulum_critic.pth")
+            agent.save("ddpg_pendulum")
+
+        elif args.mode == "test":
+            agent.load("ddpg_pendulum")
+            print("Starting testing...")
+            test(env, agent, args.test_episodes)
+
+if __name__ == "__main__":
+    main()

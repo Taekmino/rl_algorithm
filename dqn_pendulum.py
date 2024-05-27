@@ -111,7 +111,7 @@ class DQNAgent:
 
         return loss.item()
 
-for seed in range(config.NUM_SEEDS):
+for seed in range(config["NUM_SEEDS"]):
     wandb.init(project="dqn-pendulum", reinit=True, name=f'seed_{seed}', config=config)
     seed_all(seed)
 
